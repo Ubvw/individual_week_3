@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Bataan Smart Route Optimizer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #app { display: flex; height: 100%; }
+    #sidebar {
+      width: 340px;
+      padding: 12px;
+      box-shadow: 0 0 12px rgba(0,0,0,0.1);
+      z-index: 1000;
+      background: #fff;
+    }
+    #sidebar h2 { margin-top: 0; font-size: 18px; }
+    #map { flex: 1; }
+    .row { margin-bottom: 8px; }
+    label { display: block; font-size: 12px; color: #333; margin-bottom: 4px; }
+    input { width: 100%; padding: 6px 8px; box-sizing: border-box; }
+    button { padding: 8px 10px; margin-right: 6px; cursor: pointer; }
+    .muted { color: #666; font-size: 12px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; color: #fff; font-size: 12px; }
+    .pill.green { background: #2e7d32; }
+    .pill.yellow { background: #f9a825; color: #111; }
+    .pill.red { background: #c62828; }
+    .error { color: #c62828; font-size: 12px; }
+  </style>
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+</head>
+<body>
+  <div id="app">
+    <div id="sidebar">
+      <h2>Route Controls</h2>
+      <div class="row muted">Click map to set start, then end. Or input manually.</div>
+
+      <div class="row">
+        <label>Start (lat, lng)</label>
+        <input id="startLat" placeholder="14.4326" />
+        <input id="startLng" placeholder="120.4859" style="margin-top:6px" />
+      </div>
+      <div class="row">
+        <label>End (lat, lng)</label>
+        <input id="endLat" placeholder="14.6761" />
+        <input id="endLng" placeholder="120.5383" style="margin-top:6px" />
+      </div>
+      <div class="row">
+        <button id="optBtn">Optimize Route</button>
+        <button id="swapBtn">Swap</button>
+        <button id="resetBtn">Reset</button>
+      </div>
+      <div class="row" id="status" class="muted"></div>
+
+      <div class="row" id="results" style="display:none">
+        <div><strong>Distance</strong>: <span id="dist"></span> km</div>
+        <div><strong>ETA</strong>: <span id="eta"></span> min</div>
+        <div><strong>Flood Intersections</strong>: <span id="ints"></span></div>
+        <div><strong>Risk</strong>: <span id="risk"></span> <span id="riskPill" class="pill"></span></div>
+        <div id="warnings" class="muted" style="margin-top:6px"></div>
+      </div>
+      <div class="row error" id="err" style="display:none"></div>
+    </div>
+    <div id="map"></div>
+  </div>
+
+  <script>
+    const API_BASE = 'http://127.0.0.1:8000';
+
+    const map = L.map('map', {
+      maxBounds: L.latLngBounds([14.3, 120.3], [14.8, 120.7]),
+      maxBoundsViscosity: 0.8
+    }).setView([14.55, 120.5], 10);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    const floodStyle = { color: 'red', weight: 1, fillOpacity: 0.25 };
+    let floodLayer = null;
+    let routeLayer = null;
+    let startMarker = null;
+    let endMarker = null;
+
+    const startLat = document.getElementById('startLat');
+    const startLng = document.getElementById('startLng');
+    const endLat = document.getElementById('endLat');
+    const endLng = document.getElementById('endLng');
+    const optBtn = document.getElementById('optBtn');
+    const swapBtn = document.getElementById('swapBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const statusEl = document.getElementById('status');
+    const resultsEl = document.getElementById('results');
+    const errEl = document.getElementById('err');
+    const distEl = document.getElementById('dist');
+    const etaEl = document.getElementById('eta');
+    const intsEl = document.getElementById('ints');
+    const riskEl = document.getElementById('risk');
+    const riskPill = document.getElementById('riskPill');
+    const warningsEl = document.getElementById('warnings');
+
+    function setStatus(msg) { statusEl.textContent = msg || ''; }
+    function setError(msg) { errEl.style.display = msg ? 'block' : 'none'; errEl.textContent = msg || ''; }
+    function setLoading(isLoading) { optBtn.disabled = isLoading; optBtn.textContent = isLoading ? 'Optimizing…' : 'Optimize Route'; }
+
+    function setStart(latlng) {
+      startLat.value = latlng.lat.toFixed(6);
+      startLng.value = latlng.lng.toFixed(6);
+      if (startMarker) startMarker.remove();
+      startMarker = L.marker(latlng, { draggable: true }).addTo(map).bindTooltip('Start');
+      startMarker.on('dragend', () => setStart(startMarker.getLatLng()));
+    }
+    function setEnd(latlng) {
+      endLat.value = latlng.lat.toFixed(6);
+      endLng.value = latlng.lng.toFixed(6);
+      if (endMarker) endMarker.remove();
+      endMarker = L.marker(latlng, { draggable: true }).addTo(map).bindTooltip('End');
+      endMarker.on('dragend', () => setEnd(endMarker.getLatLng()));
+    }
+
+    // Click-to-select: first sets start, second sets end
+    map.on('click', (e) => {
+      const haveStart = !!startLat.value && !!startLng.value;
+      if (!haveStart) setStart(e.latlng); else setEnd(e.latlng);
+    });
+
+    swapBtn.onclick = () => {
+      const a = startLat.value, b = startLng.value, c = endLat.value, d = endLng.value;
+      startLat.value = c; startLng.value = d; endLat.value = a; endLng.value = b;
+      if (startMarker && endMarker) {
+        const s = startMarker.getLatLng();
+        startMarker.setLatLng(endMarker.getLatLng());
+        endMarker.setLatLng(s);
+      }
+    };
+    resetBtn.onclick = () => {
+      [startLat, startLng, endLat, endLng].forEach(i => i.value = '');
+      [startMarker, endMarker].forEach(m => m && m.remove());
+      startMarker = endMarker = null;
+      if (routeLayer) { routeLayer.remove(); routeLayer = null; }
+      resultsEl.style.display = 'none';
+      setError(''); setStatus('');
+    };
+
+    function riskCategory(score) {
+      if (score <= 3) return 'green';
+      if (score <= 6) return 'yellow';
+      return 'red';
+    }
+
+    async function loadFloodZones() {
+      try {
+        const res = await fetch(`${API_BASE}/flood-zones`);
+        const data = await res.json();
+        floodLayer = L.geoJSON(data, { style: floodStyle }).addTo(map);
+      } catch (e) {
+        setError('Failed to load flood zones');
+      }
+    }
+
+    async function optimize() {
+      setError(''); setStatus(''); setLoading(true);
+      try {
+        const sLat = parseFloat(startLat.value), sLng = parseFloat(startLng.value);
+        const eLat = parseFloat(endLat.value), eLng = parseFloat(endLng.value);
+        if (!isFinite(sLat) || !isFinite(sLng) || !isFinite(eLat) || !isFinite(eLng)) {
+          setError('Please set valid start and end coordinates.');
+          return;
+        }
+
+        const res = await fetch(`${API_BASE}/optimize-route`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ start: { lat: sLat, lng: sLng }, end: { lat: eLat, lng: eLng } })
+        });
+        if (!res.ok) {
+          const txt = await res.text();
+          throw new Error(`HTTP ${res.status}: ${txt}`);
+        }
+        const data = await res.json();
+
+        if (routeLayer) { routeLayer.remove(); routeLayer = null; }
+        const risk = data.risk_score ?? 0;
+        const color = riskCategory(risk);
+        routeLayer = L.geoJSON({ type: 'LineString', coordinates: data.geometry }, {
+          style: { color: color === 'green' ? '#2e7d32' : color === 'yellow' ? '#f9a825' : '#c62828', weight: 4 }
+        }).addTo(map);
+
+        if (startMarker) startMarker.bindPopup(`Start`).openPopup();
+        if (endMarker) endMarker.bindPopup(`End`).openPopup();
+
+        // Fit map to route
+        try { map.fitBounds(routeLayer.getBounds(), { padding: [20, 20] }); } catch {}
+
+        // Results panel
+        distEl.textContent = (data.distance_km ?? 0).toFixed(2);
+        etaEl.textContent = String(data.estimated_time_minutes ?? 0);
+        intsEl.textContent = String(data.flood_intersections ?? 0);
+        riskEl.textContent = (data.risk_score ?? 0).toFixed(2);
+        const pillCat = riskCategory(risk);
+        riskPill.className = `pill ${pillCat}`;
+        riskPill.textContent = pillCat.toUpperCase();
+        warningsEl.textContent = (data.warnings || []).join(' \n ');
+        resultsEl.style.display = 'block';
+
+      } catch (err) {
+        console.error(err);
+        setError(String(err).slice(0, 300));
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    optBtn.onclick = optimize;
+    loadFloodZones();
+
+    // Quick environment hints for debugging
+    fetch(`${API_BASE}/health`).then(r => r.json()).then(h => {
+      if (!h.ors_key_present) setStatus('Warning: ORS key not loaded in API');
+    }).catch(() => {});
+  </script>
+</body>
+</html>
